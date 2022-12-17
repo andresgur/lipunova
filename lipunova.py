@@ -241,9 +241,29 @@ class Advective_Disk(Disk):
         """
         w = keplerian_angular_w(R, self.M)
         rho = self.density(Wrphi, H, w)
-        denominator = 6 * rho + 3/2 * Wrphi / (-self.alpha * H**3 * w**2)
-        numerator = 9 * H * rho / R + dWrphi / (-2 * self.alpha * H**2 *w**2) + 3 /2 * Wrphi / (-self.alpha * H**2 * w**2 * R) - 3 * np.pi * R * rho * Wrphi / (Mdot * w * H) - 4*np.pi * R* c * rho /(Mdot * k_T)
+        denominator = 6 * rho - 3/2 * Wrphi / (self.alpha * H**3 * w**2)
+        numerator = 9 * H * rho / R - dWrphi / (2 * self.alpha * H**2 *w**2) - 3 /2 * Wrphi / (self.alpha * H**2 * w**2 * R) - 3 * np.pi * R * rho * Wrphi / (Mdot * w * H) - 4*np.pi * R* c * rho /(Mdot * k_T)
         return numerator / denominator
+
+
+    def Hprime_simplified(self, Mdot, H, R, Wrphi, dWrphi):
+        """Derivative of the height of the disk. Everything in cgs units. Here rho has been replaced and
+        the equations have been greatly simplified (mostly for speed purposes)
+
+        Parameters
+        ----------
+        Mdot: float,
+            Mass-accretion rate at the given radius
+        H: float,
+            Height of the disk
+        Wrphi: float
+            Stress tensor in the radial and phi coordinates
+        dWrphi: float
+            Derivative of the stress tensor
+        """
+        w = keplerian_angular_w(R, self.M)
+        dH = 1 / 9 * (12 * H / R - 3 * np.pi * R* Wrphi / (w * H * Mdot) + H * dWrphi / Wrphi - 4 * R* np.pi * c /(Mdot * k_T))
+        return dH
 
 
     def densityPrime(self, Wrphi, dWrphi, H, dH, Mdot, R):
@@ -322,7 +342,7 @@ class Advective_Disk_With_Outflows(Advective_Disk):
         w = keplerian_angular_w(R, disk.M)
         dMdot = disk.Mdotprime(H, R)
         dWrphi = disk.torque_derivative(Mdot, Wrphi, R, w)
-        dH = disk.Hprime(Mdot, H, R, Wrphi, dWrphi)
+        dH = disk.Hprime_simplified(Mdot, H, R, Wrphi, dWrphi)
         return [dH, dMdot, dWrphi]
 
     def solve(self, step=0.05, max_nodes=8000000):
@@ -378,7 +398,7 @@ class Advective_Disk_Without_Outflows(Advective_Disk):
         Wrphi = disk.torque(R, w)
         dWrphi = disk.torque_derivative(R, w)
         #rho_ = rhoPrime(rho, Mdot, H, R, M, alpha)
-        H_ = disk.Hprime(disk.Mdot_0, H, R, Wrphi, dWrphi)
+        H_ = disk.Hprime_simplified(disk.Mdot_0, H, R, Wrphi, dWrphi)
         return [H_]
 
     def solve(self, step=0.005, H_boundary=10**(-8), max_nodes=10000000):
@@ -659,114 +679,6 @@ def test_find_rsph():
     print(Rsph / R0)
     print("Using SS73 formula")
     print(9/4 * mdot)
-
-def test_disks():
-    outdir = "lipunova/%s" % "testing_disks"
-
-    if not os.path.isdir(outdir):
-        os.mkdir(outdir)
-    mdot = 0.5
-    disk = Shakura_Sunyaev_Disk(M, mdot, alpha)
-    R = np.arange(disk.Rmin, disk.Rmax, 0.05) * disk.R0
-    w = keplerian_angular_w(R, disk.M)
-    height = disk.H(R, w)
-    Qrad = disk.Q_rad(height, R)
-    Wrphi = disk.torque(R, w)
-    r = R / disk.R0
-    if False:
-        fig = plt.figure()
-        fig.suptitle("%s" % disk.name)
-        plt.plot(r, height/ R, label="H/R")
-        plt.legend()
-        fig = plt.figure()
-        fig.suptitle("%s" % disk.name)
-        plt.plot(r, Qrad * R**2)
-    Q = -3/4 * w * Wrphi
-    print("Is energy conserved in %s disks?" % disk.name)
-    print(np.allclose(Qrad, Q))
-    mdot = 100
-    if False:
-        disk = Advective_Disk_Without_Outflows(M, mdot, alpha)
-        solution = disk.solve(max_nodes=500000)
-        R = solution.x
-        w = keplerian_angular_w(R, disk.M)
-        height = solution.y[0]
-        fig = plt.figure()
-        fig.suptitle("%s" % disk.name)
-        r = R / disk.R0
-        plt.plot(r, height/ R, label="H/R")
-        Qrad = disk.Q_rad(height, R)
-        fig = plt.figure()
-        fig.suptitle("%s" % disk.name)
-        plt.plot(r, Qrad * R**2)
-        fig = plt.figure()
-        Wrphi = disk.torque(R, w)
-        dWrphi = disk.torque_derivative(R, w)
-        rho = disk.density(Wrphi, height, w)
-        Mdot = disk.Mdot_0
-        dH = disk.Hprime(Mdot, height, R, Wrphi, dWrphi)
-        drho = disk.densityPrime(Wrphi, dWrphi, height, dH, Mdot, R)
-        Qadv = disk.Q_adv(Mdot, height, dH, rho, drho, R)
-        Q = -3/4 * w * Wrphi
-        print("Is energy conserved in %s disks?" % disk.name)
-        print(np.allclose(Qrad + Qadv, Q))
-        fig.suptitle("%s" % disk.name)
-        margin = 200
-        plt.plot(r[margin:], (Qrad / Q)[margin:], label="$Q_{rad}$ / $Q^+$")
-        plt.plot(r[margin:], (Qadv / Q)[margin:], label="$Q_{adv}$ / $Q^+$")
-        plt.margins(y=0)
-        plt.legend()
-
-    disk = Advective_Disk_With_Outflows(M, mdot, alpha)
-    disk.Rmax = disk.Rsph
-    solution = disk.solve(step=0.8, max_nodes=500000*2)
-    R = solution.x
-    w = keplerian_angular_w(R, disk.M)
-    height = solution.y[0]
-    fig = plt.figure()
-    fig.suptitle("%s" % disk.name)
-    r = R / disk.R0
-    plt.plot(r, height/ R, label="H/R")
-    plt.ylim(bottom=0, top=1.1)
-    plt.legend()
-    plt.savefig("%s/H_R.png" % outdir)
-    Qrad = disk.Q_rad(height, R)
-    #Qrad[-1] = 0 # boundary condition
-    fig = plt.figure()
-    fig.suptitle("%s" % disk.name)
-    Q0 = keplerian_angular_w(disk.R0, disk.M) * disk.Mdot_0 / (8 * np.pi)
-    bottom = 0
-    top = 1
-    plt.plot(r, Qrad * r**2 / Q0, label="$Q_{rad} r^2 / Q_0$")
-    plt.ylim(bottom , top)
-    plt.savefig("%s/Q_rad.png" % outdir)
-    #plt.ylim(top=7*10**(39))
-
-    fig = plt.figure()
-    fig.suptitle("%s" % disk.name)
-    Mdot = solution.y[1]
-    plt.plot(r, Mdot / disk.Mdot_0, label="$\dot{M}$ / \dot{M_0}$")
-    plt.legend()
-    plt.savefig("%s/Mdot.png" % outdir)
-
-    fig = plt.figure()
-    Wrphi = solution.y[2]
-    Wrphi
-    rho = disk.density(Wrphi, height, w)
-    dWrphi = disk.torque_derivative(Mdot, Wrphi, R, w)
-    dH = disk.Hprime(Mdot, height, R, Wrphi, dWrphi)
-    drho = disk.densityPrime(Wrphi, dWrphi, height, dH, Mdot, R)
-    Qadv = disk.Q_adv(Mdot, height, dH, rho, drho, R)
-    Q = -3/4 * w * Wrphi
-    fig.suptitle("%s" % disk.name)
-    plt.plot(r, (Qrad / Q), label="$Q_{rad}$ / $Q^+$")
-    plt.plot(r, (Qadv / Q), label="$Q_{adv}$ / $Q^+$")
-    plt.ylim(bottom=0, top=1.1)
-    plt.legend()
-    plt.savefig("%s/Q.png" % outdir)
-
-
-    #plt.show()
 
 
 if __name__ == "__main__":
