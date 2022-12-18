@@ -69,7 +69,6 @@ def scale_height(m_r, R, M, spin=0):
 
 def keplerian_angular_w(R, M):
     """Calulate the Keplerian angular velocity at a given radius
-
     In cgs
     R: float,
         Radius at which to calculate the velocity in cm
@@ -87,6 +86,22 @@ def gravitational_radius(M):
         Mass of the compact object in grams
     """
     return G * M / (c**2)
+
+
+def mass_transfer_inner_radius(m_0, e_wind=0.5):
+    """Equation 23 from Poutanen et al 2007
+
+        Parameters
+        ----------
+        m_0: float
+            Mass-transfer rate at the donor
+        e_wind: float
+            Fraction of radiative energy that goes to accelerate the outflow
+        Returns the mass-transfer rate at the inner radius of the disk in units of m_0 (i.e. fraction of m_0 that makes it to the BH or NS)
+        """
+    a = e_wind * (0.83 - 0.25 * e_wind)
+
+    return (1 - a) / (1 - a * (2/5 * m_0) ** (- 0.5) )
 
 
 def isco_radius(M, a=0.998):
@@ -108,7 +123,6 @@ def Q_rad_shakura(w, R0, Mdot, R):
 
 def find_rsph(Qrad, radii, M, spin=0):
     """Find the spherization radius by imposing 4pi int[Qradrdr] = LEdd
-
     radii:float
         In cm
     """
@@ -153,6 +167,7 @@ class Disk():
         self.alpha = alpha
         self.spin = spin
         self.R0 = isco_radius(M, spin)
+        self.Rg = gravitational_radius(M)
         self.Mdot_0 = eddington_accretion_rate(self.M  / (M_sun.to(u.g).value), self.R0) * self.mdot
         self.name = name
         print("Disk %s with M = %.1f M_sun, dot(m) = %.1f and alpha = %.1f and spin = %.1f" % (self.name, self.M / M_sun.to(u.g).value,
@@ -163,7 +178,6 @@ class Disk():
 
     def density(self, Wrphi, H, w):
         """The sign must be flipped to get positive density
-
         Parameters
         ----------
         Wrphi: float
@@ -178,7 +192,6 @@ class Disk():
 
     def Q_rad(self, H, R):
         """Radiative energy per unit surface. All quantities in cgs
-
         Parameters
         ----------
         H: float,
@@ -191,13 +204,25 @@ class Disk():
         return Qrad # checked
 
 
-class Shakura_Sunyaev_Disk(Disk):
-    def __init__(self, M, mdot, alpha=0.1, torque_Rmin=0, spin=0, Rmin=1, Rmax=500, name="Shakura_Sunyaev_Disk"):
+    def v_r(self, Mdot, H, rho, R):
+        """Radial velocity. Equation 13 from Lipunova+1999"""
+        return Mdot / (rho * H * 4 * np.pi * R)
+
+
+class ShakuraSunyaevDisk(Disk):
+    def __init__(self, M, mdot, alpha=0.1, torque_Rmin=0, spin=0, Rmin=1, Rmax=500, name="ShakuraSunyaevDisk"):
         super().__init__(M, mdot, alpha=alpha, spin=spin, name=name, Rmin=Rmin, Rmax=Rmax)
         self.torque_Rmin = torque_Rmin
-        self.Rsph = 1.16 * self.mdot
+        self.Rsph = 1.62 * self.mdot
 
     def H(self, R, w):
+        """Disk height. Inputs in cgs units
+
+        Parameters
+        ----------
+        R: float
+        w:float
+        """
         Wrphi = self.torque(R, w)
         H = - 3 / 4 * k_T * Wrphi / (w * c)
         return H
@@ -216,8 +241,82 @@ class Shakura_Sunyaev_Disk(Disk):
         return -(self.Mdot_0 * w / (4 * np.pi * R) * (4 * np.sqrt(Rmin / R) - 3) - 2 * self.torque_Rmin * (Rmin)**2 / (R**3))
 
 
+class DiskWithOutflows(Disk):
+    def __init__(self, M, mdot, alpha=0.1, spin=0, ewind=1, Rmin=1, Rmax=500, name="with_outflows"):
+        super().__init__(M, mdot, alpha=alpha, spin=spin, name=name, Rmin=Rmin, Rmax=Rmax)
+        self.ewind = 1
+        # Approximative solution for Rpsh based on Poutanen+2007
+        self.Rsph = 1.62 * self.mdot # in units of R0
 
-class Advective_Disk(Disk):
+    def H(self, Wrphi, w):
+
+        return -3/4 * Wrphi * k_T / (w * c)
+
+    def torque_derivative(self, Mdot, Wrphi, R, w):
+        """Derivative of the torque
+        Derived from Equation (4)
+        Parameters
+        ----------
+        Mdot: float,
+            Mass-transfer rate at a given radius
+        Wrphi: float
+            The value of the torque at a given radius
+        R: float
+            The radius
+        w: float
+            Keplerian angular velocity at the given radius
+        """
+        return -(Mdot * w / (4 * np.pi)  + 2 * Wrphi) / R
+
+
+    def Mdotprime(self, H, R):
+        """From equation 12 and replacing Qrad using Equation 8 and the Pressure using Equation 9
+        All parameters in cgs units
+        Parameters
+        ----------
+        H:float,
+            Scale height
+        R: float,
+            Radius
+        """
+        return 8 * np.pi * c * H / (k_T * R) # correct units checked
+
+
+    def boundary_conditions(ya, yb, Mdot0=1):
+        """ya and yb are the values of the variables (H, Mdot and Wrphi in this case) at the boundary values (Rmin and Rmax)"""
+        Mdot_a, Wrphi_a = ya
+        Mdot_b, Wrphi_b = yb
+        zero = 10**(-3)
+        return [Mdot_b - Mdot0, Wrphi_a - zero]
+
+
+    def disk_equations(R, y, disk=None):
+        Mdot = y[0]
+        Wrphi = y[1]
+        w = keplerian_angular_w(R, disk.M)
+        dWrphi = disk.torque_derivative(Mdot, Wrphi, R, w)
+        H = disk.H(Wrphi, w)
+        return [disk.Mdotprime(H, R), dWrphi]
+
+
+    def solve(self, step=0.05, max_nodes=8000000, **kwargs):
+        R = np.arange(self.Rmin, self.Rmax, step) * self.R0
+        w = keplerian_angular_w(R, self.M)
+        # Assume the linear scaling from SS73 to start with
+        M_isco = mass_transfer_inner_radius(self.mdot, self.ewind) * self.Mdot_0
+        Mdot_guess = M_isco + (self.Mdot_0 - M_isco)  * (R / self.R0) / self.Rsph  # boundary condition, Mdot_0 at the Rsph
+        Wrphi_guess = -self.Mdot_0 * R / (self.Rsph * self.R0) * w / (4 * np.pi) * (1 - (R / self.R0)**(5/2)) / (1 + 3/2 * (R / self.R0)**(5/2))
+        Wrphi_guess[0] = 10**(-10)
+
+        y_a = np.array([Mdot_guess, -Wrphi_guess])
+
+        solution = solve_bvp(lambda R,y: DiskWithOutflows.disk_equations(R, y, self),
+                             lambda y0, y1: DiskWithOutflows.boundary_conditions(y0, y1, self.Mdot_0), R, y_a,
+                                 max_nodes=max_nodes, **kwargs)
+        return solution
+
+
+class AdvectiveDisk(Disk):
 
     def Q_adv(self, Mdot, H, dH, rho, drho, R):
         w = keplerian_angular_w(R, self.M)
@@ -227,7 +326,6 @@ class Advective_Disk(Disk):
 
     def Hprime(self, Mdot, H, R, Wrphi, dWrphi):
         """Derivative of the height of the disk. Everything in cgs units.
-
         Parameters
         ----------
         Mdot: float,
@@ -246,10 +344,9 @@ class Advective_Disk(Disk):
         return numerator / denominator
 
 
-    def Hprime_simplified(self, Mdot, H, R, Wrphi, dWrphi):
+    def Hprime_simplified(self, Mdot, H, R, Wrphi, dWrphi, w):
         """Derivative of the height of the disk. Everything in cgs units. Here rho has been replaced and
         the equations have been greatly simplified (mostly for speed purposes)
-
         Parameters
         ----------
         Mdot: float,
@@ -260,15 +357,14 @@ class Advective_Disk(Disk):
             Stress tensor in the radial and phi coordinates
         dWrphi: float
             Derivative of the stress tensor
+        w: float
+            Keplerian angular velocity
         """
-        w = keplerian_angular_w(R, self.M)
-        dH = 1 / 9 * (12 * H / R - 3 * np.pi * R* Wrphi / (w * H * Mdot) + H * dWrphi / Wrphi - 4 * R* np.pi * c /(Mdot * k_T))
-        return dH
+        return 1 / 9 * (12 * H / R - 3 * np.pi * R* Wrphi / (w * H * Mdot) + H * dWrphi / Wrphi - 4 * R* np.pi * c /(Mdot * k_T))
 
 
     def densityPrime(self, Wrphi, dWrphi, H, dH, Mdot, R):
         """Derivative of the density (unused for now) at the given radius
-
         Parameters
         ----------
         Wrphi: float,
@@ -288,18 +384,53 @@ class Advective_Disk(Disk):
         return -1/(2 * self.alpha * H**3 * w**2) * (dWrphi - 3 * Wrphi * dH / H + 3 * Wrphi / R)
 
 
-class Advective_Disk_With_Outflows(Advective_Disk):
-    def __init__(self, M, mdot, alpha=0.1, spin=0, ewind=1, Rmin=1, Rmax=500, name="with_outflows"):
+class AdvectiveDiskWithOutflows(AdvectiveDisk):
+    def __init__(self, M, mdot, alpha=0.1, spin=0, ewind=1, Rmin=1, Rmax=500, name="advective_with_outflows"):
         super().__init__(M, mdot, alpha=alpha, spin=spin, name=name, Rmin=Rmin, Rmax=Rmax)
-        self.ewind = 1
-        self.Rsph = (1.34 - 0.4 * ewind + 0.1 *ewind**2 -(1.1 - ewind * 0.7) * self.mdot ** (-2/3)) * self.mdot # in units of R0
+        self.ewind = ewind
+        # Approximative solution for Rpsh based on Poutanen+2007
+        self.Rsph = (1.34 - 0.4 * ewind + 0.1 * ewind**2 -(1.1 - 0.7 * ewind) * (self.mdot ** (-2/3))) * self.mdot # in units of R0
 
+
+    def boundary_conditions(ya, yb, Mdot0=1):
+        """ya and yb are the values of the variables (H, Mdot and Wrphi in this case) at the boundary values (Rmin and Rmax)"""
+        H_a, Mdot_a, Wrphi_a = ya
+        H_b, Mdot_b, Wrphi_b = yb
+        zero = 10**(-10)
+        return np.array([H_a -zero, Mdot_b - Mdot0, Wrphi_a + zero])
+
+
+    def disk_equations(R, y, disk=None):
+        H = y[0]
+        Mdot = y[1]
+        Wrphi = y[2]
+        w = keplerian_angular_w(R, disk.M)
+        dWrphi = disk.torque_derivative(Mdot, Wrphi, R, w)
+        return np.vstack((disk.Hprime_simplified(Mdot, H, R, Wrphi, dWrphi, w), disk.Mdotprime(H, R), dWrphi))
+
+
+    def solve(self, step=0.05, max_nodes=8000000, **kwargs):
+        R = np.arange(self.Rmin, self.Rmax, step) * self.R0
+        w = keplerian_angular_w(R, self.M)
+        # Assume the linear scaling from SS73 to start with
+        M_isco = mass_transfer_inner_radius(self.mdot, self.ewind) * self.Mdot_0
+        Mdot_guess = M_isco + (self.Mdot_0 - M_isco)  * (R / self.R0) / self.Rsph  # boundary condition, Mdot_0 at the Rsph
+        Wrphi_guess = self.Mdot_0 * R / (self.Rsph * self.R0) * w / (4 * np.pi) * (1 - (R / self.R0)**(5/2)) / (1 + 3/2 * (R / self.R0)**(5/2))
+        Wrphi_guess[0] = 10**(-10)
+        H_guess = -3/4 * Wrphi_guess * k_T / (w * c)
+
+
+        y_a = np.array([H_guess, Mdot_guess, Wrphi_guess])
+
+        solution = solve_bvp(lambda R,y: AdvectiveDiskWithOutflows.disk_equations(R, y, self),
+                             lambda y0, y1: AdvectiveDiskWithOutflows.boundary_conditions(y0, y1, self.Mdot_0), R, y_a,
+                                 max_nodes=max_nodes, **kwargs)
+        return solution
 
 
     def Mdotprime(self, H, R):
         """From equation 12 and replacing Qrad using Equation 8 and the Pressure using Equation 9
         All parameters in cgs units
-
         Parameters
         ----------
         H:float,
@@ -313,7 +444,6 @@ class Advective_Disk_With_Outflows(Advective_Disk):
     def torque_derivative(self, Mdot, Wrphi, R, w):
         """Derivative of the torque
         Derived from Equation (4)
-
         Parameters
         ----------
         Mdot: float,
@@ -328,64 +458,15 @@ class Advective_Disk_With_Outflows(Advective_Disk):
         return -(Mdot * w / (4 * np.pi)  + 2 * Wrphi) / R
 
 
-    def boundary_conditions(ya, yb, Mdot0=0):
-        """ya and yb are the values of the variables (H, Mdot and Wrphi in this case) at the boundary values (Rmin and Rmax)"""
-        H_a, Mdot_a, Wrphi_a = ya
-        H_b, Mdot_b, Wrphi_b = yb
-        return [H_a -10**(-8), Mdot_b - Mdot0, Wrphi_a -10**(-8)]
+class AdvectiveDiskWithoutOutflows(AdvectiveDisk):
 
-
-    def disk_equations(R, y, disk=None):
-        H = y[0]
-        Mdot = y[1]
-        Wrphi = y[2]
-        w = keplerian_angular_w(R, disk.M)
-        dMdot = disk.Mdotprime(H, R)
-        dWrphi = disk.torque_derivative(Mdot, Wrphi, R, w)
-        dH = disk.Hprime_simplified(Mdot, H, R, Wrphi, dWrphi)
-        return [dH, dMdot, dWrphi]
-
-    def solve(self, step=0.05, max_nodes=8000000):
-        R = np.arange(self.Rmin, self.Rmax, step) * self.R0
-        w = keplerian_angular_w(R, self.M)
-        H_guess = scale_height(1, R, self.M)
-        H_guess[0] = 10**(-8) # boundary condition, H=0 at the inner radius
-        # Assume the linear scaling from SS73 to start with
-        Mdot_guess = self.Mdot_0 * R / (self.Rsph * self.R0) # boundary condition, Mdot_0 at the Rsph
-        Wrphi_guess = -Mdot_guess * w / (4 * np.pi) * (1 - (R / self.R0)**(5/2)) / (1 + 3/2 * (R / self.R0)**(5/2))
-        Wrphi_guess[0] = -10**(-8)
-        #plt.figure()
-        #plt.plot(R/R0, -Wrphi_guess)
-        #plt.xscale("log")
-        #plt.show()
-        y = np.array([H_guess, Mdot_guess, -Wrphi_guess])
-
-        solution = solve_bvp(lambda R,y: Advective_Disk_With_Outflows.disk_equations(R, y, disk=self),
-                             lambda y0, y1: Advective_Disk_With_Outflows.boundary_conditions(y0, y1, Mdot0=self.Mdot_0), R, y, verbose=2,
-                                 max_nodes=max_nodes)
-        return solution
-
-
-def dW_dr(W, R, M, mdot0=1000, ewind=0.5):
-    Medd = (eddington_luminosity(M * u.g).decompose(bases=[u.cm, u.g, u.s]) / (c.to(u.cm/u.s))** 2 / 0.1).value
-    def mdot_r(r, mdot0, ewind=ewind):
-        misco = mass_transfer_inner_radius(mdot0, ewind) * mdot0
-        Rsph = 1.62 * mdot0 * (10**6 * u.cm).value
-        m_r = misco + (mdot0 - misco) * r / Rsph
-        return m_r
-    return 2 / (R) * W - (1 / (4 * np.pi * (R)**2) * np.sqrt(G.decompose(bases=u.cgs.bases).value * M / (R)))  * mdot_r(R, mdot0) * Medd
-
-
-class Advective_Disk_Without_Outflows(Advective_Disk):
-
-    def __init__(self, M, mdot, alpha=0.1, spin=0, torque_Rmin=10**-5, Rmin=1, Rmax=500, name="no_outflows"):
+    def __init__(self, M, mdot, alpha=0.1, spin=0, torque_Rmin=10**(-12), Rmin=1, Rmax=500, name="advective_no_outflows"):
         super().__init__(M, mdot, alpha=alpha, spin=spin, name=name, Rmin=Rmin, Rmax=Rmax)
         self.torque_Rmin = torque_Rmin
 
 
-    def boundary_conditions(ya, yb, H_boundary=10**(-8)):
+    def boundary_conditions(ya, yb, H_boundary=10**(-15)):
         """ya and yb are the values of the variables at the boundary values (Rin and Rout)
-
         H is zero at the inner boundary
         """
         H_a = ya
@@ -398,19 +479,19 @@ class Advective_Disk_Without_Outflows(Advective_Disk):
         Wrphi = disk.torque(R, w)
         dWrphi = disk.torque_derivative(R, w)
         #rho_ = rhoPrime(rho, Mdot, H, R, M, alpha)
-        H_ = disk.Hprime_simplified(disk.Mdot_0, H, R, Wrphi, dWrphi)
+        H_ = disk.Hprime_simplified(disk.Mdot_0, H, R, Wrphi, dWrphi, w)
         return [H_]
 
-    def solve(self, step=0.005, H_boundary=10**(-8), max_nodes=10000000):
+    def solve(self, step=0.005, H_boundary=10**(-4), max_nodes=10000000, **kwargs):
         R = np.arange(self.Rmin, self.Rmax, step) * self.R0
         H_guess = scale_height(self.mdot, R, self.M) # solution is independent of initial guess
         H_guess[0] = H_boundary # boundary condition, H=0 at the inner radius
 
         y = np.array([H_guess])
 
-        solution = solve_bvp(lambda R,y: Advective_Disk_Without_Outflows.disk_equations(R, y, disk=self),
-                             lambda y0, y1: Advective_Disk_Without_Outflows.boundary_conditions(y0, y1, H_boundary=H_boundary), R, y, verbose=2,
-                             max_nodes=max_nodes)
+        solution = solve_bvp(lambda R,y: AdvectiveDiskWithoutOutflows.disk_equations(R, y, disk=self),
+                             lambda y0, y1: AdvectiveDiskWithoutOutflows.boundary_conditions(y0, y1, H_boundary=H_boundary), R, y,
+                             max_nodes=max_nodes, **kwargs)
         return solution
 
 
@@ -431,11 +512,11 @@ class Advective_Disk_Without_Outflows(Advective_Disk):
 def test_solve_full_disk():
     outdir = "lipunova/full_disk"
     Ledd = eddington_luminosity(M)
-    #outer_disk = Advective_Disk_Without_Outflows(M, mdot, alpha)
+    #outer_disk = AdvectiveDisk_Without_Outflows(M, mdot, alpha)
     Rsph = 300 # in units of R0
-    inner_disk = Advective_Disk_With_Outflows(M, mdot, alpha, Rmin=1, Rmax=Rsph)
+    inner_disk = AdvectiveDiskWithOutflows(M, mdot, alpha, Rmin=1, Rmax=Rsph)
     Rmax = 2000
-    outer_disk = Shakura_Sunyaev_Disk(M, mdot, alpha, Rmin=Rsph, Rmax=Rmax)
+    outer_disk = ShakuraSunyaevDisk(M, mdot, alpha, Rmin=Rsph, Rmax=Rmax)
 
     print("Init Rsph")
     print(inner_disk.Rsph)
@@ -444,21 +525,20 @@ def test_solve_full_disk():
     tolerance = 10**-3
     max_iter = 50
     iter = 0
-    plt.figure()
-    plt.xscale("log")
-    plt.xlabel("$R/R_0$")
+
     L = 0
     while (np.abs(L - Ledd) > tolerance) or iter>max_iter:
         Rsph_2 = Rsph
         inner_disk.Rmax = Rsph_2
-        sol_inner_disk = inner_disk.solve(max_nodes=500000)
+        sol_inner_disk = inner_disk.solve(max_nodes=1000000, verbose=2)
         r_in = sol_inner_disk.x
         H_outflow = sol_inner_disk.y[0]
         Mdot_inner = sol_inner_disk.y[1]
         Wrphi = sol_inner_disk.y[2]
+
         H_Rsph = H_outflow[-1]
         Mdot_Rsph = Mdot_inner[-1]
-        w_Rsph = keplerian_angular_w(Rsph * R0, inner_disk.M)
+        w_Rsph = keplerian_angular_w(Rsph_2 * R0, inner_disk.M)
         Wrphi_Rsph = Wrphi[-1]
         outer_disk.torque_Rsph = Wrphi_Rsph
         outer_disk.Rmin = Rsph_2
@@ -480,13 +560,19 @@ def test_solve_full_disk():
         #print(L / Ledd)
         #print(Rsph / outer_disk.R0)
         R = np.append(r_in, r_out)
+        r = R  / outer_disk.R0
         H =  np.append(H_outflow, H_no_outflow)
         Mdot = np.append(Mdot_inner, np.ones(len(r_out)) * outer_disk.Mdot_0)
-        plt.plot(R / R0, H / R, label="H/R")
-        plt.plot(R/R0, Mdot / inner_disk.Mdot_0, label="$\dot{M}$ / M$_0$")
+        margin = 700
+        plt.figure()
+        plt.xscale("log")
+        plt.xlabel("$R/R_0$")
+        plt.plot(r[margin:], (H / R)[margin:], label="H/R")
+        plt.plot(r[margin:], Mdot[margin:] / inner_disk.Mdot_0, label="$\dot{M}$ / M$_0$")
         plt.axvline(Rsph, ls="--", color="black")
         plt.legend()
         plt.margins(x=0.025)
+        plt.ylim(bottom=0, top=2)
         plt.savefig("%s/todelete_%d.png" % (outdir, iter))
         iter+=1
 
@@ -503,157 +589,74 @@ def test_solve_full_disk():
     plt.margins(x=0)
     plt.savefig("%s/todelete.png" %outdir)
 
-
-def test_solve_disk():
-    outflow_disk = Advective_Disk_With_Outflows(M, mdot, alpha)
-    outflow_disk.Rmax = outflow_disk.Rsph
-    w_Rsph = keplerian_angular_w(outflow_disk.Rsph * outflow_disk.R0, outflow_disk.M)
-    solution = outflow_disk.solve(max_nodes=1200000)
-    r_in = solution.x
-    Wrphi_Rsph = solution.y[2][-1]
-    H_in = solution.y[0]
-    H_Rsph = H_in[-1]
-    disk = Advective_Disk_Without_Outflows(M, mdot, alpha, torque_Rmin=Wrphi_Rsph, Rmin=outflow_disk.Rsph,
-                                           Rmax=10**4)
-
-    solution = disk.solve(H_boundary=H_Rsph)
-
-    outdir = "lipunova/%s" % disk.name
-
-    if not os.path.isdir(outdir):
-        os.mkdir(outdir)
-
-    r_out = solution.x
-    H_out = solution.y[0]
-
-    if disk.name == "with_outflows":
-        Mdot = solution.y[1]
-    else:
-        Mdot = disk.Mdot_0 * np.ones(len(r_out))
-
-    plt.figure()
-    plt.scatter(r_out / disk.R0, H_out/ r_out, label="H/R")
-    margin = 50
-    #plt.scatter(r_in[margin:] / disk.R0, (H_in/ r_in)[margin:], label="H/R")
-    #plt.axvline(outflow_disk.Rsph, ls="--", color="black")
-    plt.xscale("log")
-    #plt.scatter(R/disk.R0, Mdot / disk.Mdot_0, label="$\dot{M}$ / M$_0$")
-    #plt.axvline(disk.Rsph, ls="--", color="black")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0.025)
-    plt.savefig("%s/todelete_H.png" %outdir)
-
-    plt.figure()
-    plt.plot(r_out / disk.R0, disk.Q_rad(H_out,r_out) * r_out**2, label="Q$_{rad}\\times R^2$")
-    plt.xscale("log")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0.025, y=0)
-    plt.savefig("%s/todelete_rad.png" % outdir)
-
-    plt.figure()
-    w = keplerian_angular_w(r_out, disk.M)
-    Wrphi = disk.torque(r_out, w)
-
-    rho = disk.density(Wrphi, H_out, w)
-    plt.plot(r_out / disk.R0, (rho * H_out), label="$\Sigma$ (g/cm$^2$)")
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0.025)
-    plt.savefig("%s/todelete2_rho.png" % outdir)
-
-    plt.figure()
-    plt.plot(r_out / disk.R0, Wrphi, label="$W_{r\phi}$")
-    plt.xscale("log")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0.025)
-    plt.savefig("%s/todelete2_torque.png" % outdir)
-
-    plt.figure()
-    Q_ = -3/4 *w* Wrphi
-    dWrphi = disk.torque_derivative(R, w)
-    dH = disk.Hprime(Mdot, H, R, Wrphi, dWrphi)
-    drho = disk.densityPrime(Wrphi, dWrphi, H_out, dH, Mdot, R)
-    plt.plot(r_out / disk.R0, disk.Q_rad(H_out,r_out) / (Q_), label="$Q_{rad} / Q^+$")
-    plt.plot(r_out / disk.R0, disk.Q_adv(Mdot, H_out, dH, rho, drho, r_out) / (Q_), label="$Q_{adv} / Q^+$")
-    plt.xscale("log")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0.025)
-    plt.savefig("%s/todelete_rad.png" % outdir)
-    print("Outputs stored to %s" % outdir)
-
 def test_disk_outflows():
 
-    #disk_with_outflows()
-    disk = Advective_Disk_With_Outflows(M, mdot, alpha)
-    solution = disk.solve(Rmin=1.01, Rmax= disk.Rsph)
-
-    outdir = "lipunova/%s" % disk.name
-
-    if not os.path.isdir(outdir):
-        os.mkdir(outdir)
-
+    disk = AdvectiveDiskWithOutflows(M, mdot, alpha, Rmin=1, spin=0)
+    disk.Rmax = disk.Rsph # set the maximum radius to the spherization radius where the outflow starts to develop
+    step = 0.1
+    solution = disk.solve(step=step, max_nodes=4000000, verbose=2) # reduce the step to reduce the computational burden
     R = solution.x
-    H = solution.y[0]
-
-    if disk.name == "with_outflows":
-        Mdot = solution.y[1]
-    else:
-        Mdot = disk.Mdot_0 * np.ones(len(R))
-
-    plt.figure()
-    plt.plot(R / disk.R0, H / R, label="H/R")
-    plt.axvline(disk.Rsph)
-    plt.xscale("log")
-    plt.plot(R/disk.R0, Mdot / disk.Mdot_0, label="$\dot{M}$ / M$_0$")
-    plt.axvline(disk.Rsph, ls="--", color="black")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0)
-    plt.savefig("%s/todelete.png" %outdir)
-
-    plt.figure()
-    plt.plot(R / disk.R0, disk.Q_rad(H,R) * R**2, label="Q$_{rad}\\times R^2$")
-    plt.xscale("log")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0)
-    plt.savefig("%s/todelete_rad.png" % outdir)
-    print("Outputs stored to %s" % outdir)
-
+    height = solution.y[0]
+    Mdot = solution.y[1]
     Wrphi = solution.y[2]
     w = keplerian_angular_w(R, disk.M)
-    rho = disk.density(Wrphi, H, w)
-    plt.figure()
-    plt.plot(R / disk.R0, rho * H, label="$\Sigma$ (g/cm$^2$)")
-    plt.xscale("log")
+    outdir = "lipunova/%s_step%.3f" % (disk.name, step)
+    if not os.path.isdir(outdir):
+        os.mkdir(outdir)
+    fig = plt.figure()
+    fig.suptitle("%s" % disk.name)
+    r = R / disk.R0
+    plt.plot(r, height/ R, label="$H/R$")
+    plt.plot(r, Mdot / disk.Mdot_0, label="$\dot{M} / \dot{M_0}$")
+    plt.xlabel("$R / R_0$")
+    plt.ylim(bottom=-0.1, top=5)
     plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0)
-    plt.savefig("%s/todelete2_rho.png" % outdir)
+    plt.savefig("%s/todelete_H_R.png" % outdir)
+
+    Qrad = disk.Q_rad(height, R)
+    #Qrad[-1] = 0 # boundary condition
+    fig = plt.figure()
+    fig.suptitle("%s" % disk.name)
+    Q0 = keplerian_angular_w(disk.R0, disk.M) * disk.Mdot_0 / (8 * np.pi) # just a normalization factor
+    plt.plot(r, Qrad * r**2 / Q0, label="$Q_{rad} r^2 / Q_0$")
+    plt.ylim(bottom=0, top=10)
+    plt.xlabel("$R / R_0$")
+    plt.ylabel("$Q_{rad} \\times r^2 / Q_0$")
+    plt.savefig("%s/todelete_Qrad.png" % outdir)
+
+
+    rho = disk.density(Wrphi, height, w)
+    dWrphi = disk.torque_derivative(Mdot, Wrphi, R, w)
+    dH = disk.Hprime_simplified(Mdot, height, R, Wrphi, dWrphi, w)
+    drho = disk.densityPrime(Wrphi, dWrphi, height, dH, Mdot, R)
+    Qadv = disk.Q_adv(Mdot, height, dH, rho, drho, R)
+    Q = -3/4 * w * Wrphi
+    fig = plt.figure()
+    fig.suptitle("%s" % disk.name)
+    margin = 200
+    plt.plot(r[margin:], (Qrad / Q)[margin:], label="$Q_{rad}$ / $Q^+$")
+    plt.plot(r[margin:], (Qadv / Q)[margin:], label="$Q_{adv}$ / $Q^+$")
+    plt.ylim(bottom=0, top=1.1)
+    plt.legend()
+    plt.xlabel("$R / R_0$")
+    plt.savefig("%s/todelete_Q.png" % outdir)
 
     plt.figure()
-    plt.plot(R / disk.R0, Wrphi, label="$W_{r\phi}$")
-    plt.xscale("log")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0)
-    plt.savefig("%s/todelete2_torque.png" % outdir)
+    fig.suptitle("%s" % disk.name)
+    plt.plot(r, Wrphi)
+    plt.ylabel("W$_{r\phi}$")
+    plt.xlabel("$R / R_0$")
+    plt.savefig("%s/todelete_Wrphi.png" % outdir)
 
-    plt.figure()
-    Q_ = -3/4 *w* Wrphi
-    plt.plot(R / disk.R0, disk.Q_rad(H,R) / (Q_), label="$Q_{rad} / Q^+$")
-    plt.xscale("log")
-    plt.legend()
-    plt.xlabel("$R/R_0$")
-    plt.margins(x=0)
-    plt.savefig("%s/todelete_rad.png" % outdir)
-    print("Outputs stored to %s" % outdir)
+    # density
+    fig = plt.figure()
+    fig.suptitle("%s" % disk.name)
+    margin = 300
+    plt.plot(r[margin:], rho[margin:]) # avoid the singularity at R_0
+    plt.margins(x=0.025, y=0.025)
+    plt.ylabel("$\\rho$ (g/cm$^3$)")
+    plt.xlabel("$R / R_0$")
+    plt.savefig("%s/todelete_rho.png" % outdir)
 
 
 def test_find_rsph():
@@ -685,17 +688,17 @@ if __name__ == "__main__":
 
     if not os.path.isdir("lipunova"):
         os.mkdir("lipunova")
-    mdot = 200
+    mdot = 10
     alpha = 0.1
     M = 10 * M_sun.to(u.g).value
     R0 = isco_radius(M, 0)
     Mdot_0 = eddington_accretion_rate(M  / (M_sun.to(u.g).value), R0) * mdot
 
     #test_solve_disk()
-    #test_disk_outflows()
+    test_disk_outflows()
     #test_solve_full_disk()
     #test_find_rsph()
-    test_disks()
+    #test_disks()
 
 
 
